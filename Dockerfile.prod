@@ -1,0 +1,45 @@
+# Stage 1: Builder - Install all dependencies and build frontend
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci
+
+COPY . .
+
+# Build the frontend
+RUN npm run build
+
+# Stage 2: Runtime - Minimal production image
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install only production dependencies
+RUN npm ci --only=production && \
+    npm cache clean --force && \
+    rm -rf /tmp/* /var/tmp/* /var/log/*
+
+# Copy only necessary files from builder
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/server.ts ./
+COPY --from=builder /app/src ./src
+
+# Clean unnecessary files
+RUN rm -rf /root/.cache && \
+    find . -name "*.map" -delete && \
+    find . -name "*.test.js" -delete && \
+    find . -name "*.spec.js" -delete
+
+# Expose port
+EXPOSE 3000
+
+# Set production environment
+ENV NODE_ENV=production
+
+# Start the server with tsx
+CMD ["npx", "tsx", "server.ts"]

@@ -13,6 +13,7 @@ export interface LearningPlan {
   name: string;
   description: string;
   attachments?: Attachment[];
+  dueDate?: string;
   createdAt: string;
 }
 
@@ -44,6 +45,8 @@ export interface Note {
   categories: string[];
   learningPlanId?: string;
   moduleId?: string;
+  isPlaceholder?: boolean;
+  embedding?: number[] | Float32Array;
   createdAt: string;
   updatedAt: string;
 }
@@ -72,6 +75,22 @@ export interface QuizResult {
   }[];
 }
 
+export type TodoStatus = 'backlog' | 'todo' | 'in-progress' | 'done';
+
+export interface Todo {
+  id: string;
+  title: string;
+  description?: string;
+  status: TodoStatus;
+  dueDate?: string;
+  learningPlanId?: string;
+  moduleId?: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  duration?: number; // Duration in milliseconds from in-progress to done
+}
+
 export interface AppData {
   notes: Note[];
   results: QuizResult[];
@@ -83,6 +102,7 @@ export interface AppData {
   initialAssessments: InitialAssessment[];
   flashcardSets: FlashcardSet[];
   flashcards: Flashcard[];
+  todos: Todo[];
 }
 
 export interface Conversation {
@@ -117,7 +137,9 @@ export interface Flashcard {
   setId: string;
   front: string;
   back: string;
+  learned?: boolean; // Mark as completed/learned
   createdAt: string;
+  updatedAt?: string;
 }
 
 export interface FlashcardSet {
@@ -126,5 +148,6 @@ export interface FlashcardSet {
   description: string;
   learningPlanId?: string;
   moduleId?: string;
+  noteIds?: string[]; // Track which notes were used to create this set
   createdAt: string;
 }

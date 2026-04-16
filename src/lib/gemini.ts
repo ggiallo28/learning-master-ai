@@ -5,7 +5,7 @@ export const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 export async function generateEmbedding(text: string): Promise<number[]> {
   try {
     const response = await ai.models.embedContent({
-      model: "gemini-embedding-2-preview",
+      model: process.env.GEMINI_EMBED_MODEL || "gemini-embedding-2-preview",
       contents: [{
         parts: [{ text }]
       }]
@@ -31,7 +31,7 @@ export async function analyzeKnowledgeGaps(notes: any[], results: any[]) {
   `;
 
   const response = await ai.models.generateContent({
-    model: "gemini-3-flash-preview",
+    model: process.env.GEMINI_TEXT_MODEL || "gemini-3-flash-preview",
     contents: prompt,
     config: {
       responseMimeType: "application/json"
@@ -64,7 +64,7 @@ export async function generateQuizFromNotes(notes: any[], attachments: any[] = [
   `;
 
   const response = await ai.models.generateContent({
-    model: "gemini-3-flash-preview",
+    model: process.env.GEMINI_TEXT_MODEL || "gemini-3-flash-preview",
     contents: prompt,
     config: {
       responseMimeType: "application/json"
@@ -92,7 +92,7 @@ export async function extractTopicsAndAnalyze(questions: any[], results: any[], 
   `;
 
   const response = await ai.models.generateContent({
-    model: "gemini-3-flash-preview",
+    model: process.env.GEMINI_TEXT_MODEL || "gemini-3-flash-preview",
     contents: prompt,
     config: {
       responseMimeType: "application/json"
@@ -119,7 +119,7 @@ export async function generateFlashcardsFromNotes(notes: any[], existingFlashcar
   `;
 
   const response = await ai.models.generateContent({
-    model: "gemini-3-flash-preview",
+    model: process.env.GEMINI_TEXT_MODEL || "gemini-3-flash-preview",
     contents: prompt,
     config: {
       responseMimeType: "application/json"
@@ -127,4 +127,24 @@ export async function generateFlashcardsFromNotes(notes: any[], existingFlashcar
   });
 
   return JSON.parse(response.text);
+}
+
+export async function summarizeNote(title: string, content: string) {
+  const prompt = `
+    Summarize the following study note into a concise overview. 
+    Focus on the key points, main arguments, and essential takeaways.
+    Use bullet points if appropriate.
+    
+    Title: ${title}
+    Content: ${content}
+    
+    Return the summary as a plain string (Markdown format is allowed).
+  `;
+
+  const response = await ai.models.generateContent({
+    model: process.env.GEMINI_TEXT_MODEL || "gemini-3-flash-preview",
+    contents: prompt
+  });
+
+  return response.text;
 }

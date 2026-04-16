@@ -22,7 +22,7 @@ export interface GeneratedModule {
 export async function generateModulesFromAI(description: string): Promise<GeneratedModule[]> {
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
+      model: process.env.GEMINI_TEXT_MODEL || "gemini-3-flash-preview",
       contents: `Generate a module structure for: ${description}`,
       config: {
         systemInstruction: `You are an expert curriculum designer. 
@@ -82,21 +82,27 @@ export async function organizeQuickNote(
     }
 
     const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
+      model: process.env.GEMINI_TEXT_MODEL || "gemini-3-flash-preview",
       contents: [{ role: "user", parts }],
       config: {
         systemInstruction: `You are an expert study assistant for Learning Master AI. 
         Your task is to take raw, messy notes (and optional images) and organize them into structured, high-quality study notes.
         
-        CRITICAL GUIDELINES:
+        GUIDELINES:
         1. SPLIT BY TOPIC: If the input contains multiple distinct topics or concepts, split them into SEPARATE notes.
-        2. MODULE SELECTION: Assign each note to the most relevant module from the provided list. If a note doesn't fit any module, leave moduleId empty.
+        2. MODULE SELECTION: Assign each note to the most relevant module from the provided list. 
+           - You MUST use the EXACT ID (e.g., "uuid-123") from the "Available Modules" list below.
+           - If the input text strongly relates to a module's name or description, you MUST use that moduleId.
+           - If multiple modules seem relevant, pick the most specific one.
+           - If NO module is relevant, leave moduleId empty.
         3. FORMATTING: Always use Markdown for the content.
         4. CATEGORIES: Extract 1-3 relevant categories per note.
         5. IMAGES: If an image is provided, describe its key educational content and incorporate it into the relevant note(s).
         
         Available Modules:
-        ${availableModules.map(m => `- [ID: ${m.id}] ${m.name}: ${m.description}`).join("\n")}`,
+        ${availableModules.length > 0 
+          ? availableModules.map(m => `- [ID: ${m.id}] ${m.name}: ${m.description}`).join("\n")
+          : "None available. Please leave moduleId empty."}`,
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
@@ -133,10 +139,63 @@ export async function organizeQuickNote(
   }
 }
 
+export async function generateKanbanTasks(
+  planDescription: string,
+  modules: { name: string, description: string, submodules?: { name: string, description: string }[] }[],
+  dueDate?: string
+): Promise<{ title: string, description: string, status: string, dueDate?: string }[]> {
+  try {
+    const response = await ai.models.generateContent({
+      model: process.env.GEMINI_TEXT_MODEL || "gemini-3-flash-preview",
+      contents: `Generate a list of study tasks for this learning plan: ${planDescription}. 
+      Modules: ${JSON.stringify(modules)}. 
+      Overall Due Date: ${dueDate || "Not specified"}.`,
+      config: {
+        systemInstruction: `You are an expert project manager for students. 
+        Your task is to create a comprehensive list of actionable study tasks (Kanban cards) based on a learning plan and its modules.
+        
+        GUIDELINES:
+        1. Create tasks for each module and submodule.
+        2. Include tasks for "Initial Review", "Deep Dive", "Practice Quiz", and "Final Review".
+        3. Distribute due dates logically if an overall due date is provided.
+        4. Tasks should be actionable (e.g., "Complete Module 1 Practice Quiz").
+        5. Return tasks in 'backlog' or 'todo' status.`,
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            tasks: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  title: { type: Type.STRING },
+                  description: { type: Type.STRING },
+                  status: { type: Type.STRING, enum: ["backlog", "todo"] },
+                  dueDate: { type: Type.STRING }
+                },
+                required: ["title", "description", "status"]
+              }
+            }
+          },
+          required: ["tasks"]
+        }
+      }
+    });
+
+    const data = JSON.parse(response.text);
+    return data.tasks || [];
+  } catch (error) {
+    console.error("generateKanbanTasks failed:", error);
+    return [];
+  }
+}
+
 export async function askStudyAssistant(
   question: string, 
   history: { role: string, content: string }[] = [],
-  context: { learningPlanId?: string, moduleId?: string, callbacks: any }
+  context: { learningPlanId?: string, moduleId?: string, callbacks: any, notes?: any[] },
+  onToken?: (token: string) => void
 ) {
   const tools = [
     {
@@ -274,13 +333,13 @@ export async function askStudyAssistant(
   }));
   messages.push({ role: "user", parts: [{ text: question }] });
 
-  try {
-    let response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
-      contents: messages,
-      config: {
-        systemInstruction: `You are a powerful study assistant for Learning Master AI with the ability to control the application interface.
+  const systemInstruction = `You are a powerful study assistant for Learning Master AI with the ability to control the application interface.
         
+        ${context.notes ? `CONTEXT NOTES PROVIDED BY USER:
+        ${context.notes.map(n => `Title: ${n.title}\nContent: ${n.content}`).join("\n---\n")}
+        
+        Please focus your answers on the context provided above if relevant.` : ""}
+
         Capabilities:
         1. Search: Find relevant information in existing notes.
         2. Add Notes: If you learn something new or summarize a topic, add it as a note for the user.
@@ -293,16 +352,40 @@ export async function askStudyAssistant(
         - If the user asks to "show me my notes" or "go to quizzes", use navigate_to.
         - If the user wants a summary of everything, use export_book.
         - Be proactive. If a conversation leads to a good summary, offer to save it as a note.
-        - Cite your sources by note title.`,
+        - Cite your sources by note title.`;
+
+  try {
+    let result = await ai.models.generateContentStream({
+      model: process.env.GEMINI_TEXT_MODEL || "gemini-3-flash-preview",
+      contents: messages,
+      config: {
+        systemInstruction,
         tools: [{ functionDeclarations: tools }]
       }
     });
 
+    let fullText = "";
+    let hasFunctionCall = false;
+    let lastChunk: any = null;
+
+    for await (const chunk of result) {
+      lastChunk = chunk;
+      if (chunk.functionCalls && chunk.functionCalls.length > 0) {
+        hasFunctionCall = true;
+        break;
+      }
+      const text = chunk.text;
+      if (text) {
+        fullText += text;
+        if (onToken) onToken(text);
+      }
+    }
+
     // Handle tool calls loop
-    while (response.functionCalls && response.functionCalls.length > 0) {
+    while (hasFunctionCall) {
+      const response = lastChunk;
       const toolResponses = [];
       
-      // Add model's full response content to history (includes thought/reasoning)
       messages.push(response.candidates[0].content);
 
       for (const fc of response.functionCalls) {
@@ -319,23 +402,38 @@ export async function askStudyAssistant(
         }
       }
 
-      // Add tool responses to history
       messages.push({
         role: "user",
         parts: toolResponses
       });
 
-      // Call model again with tool results
-      response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
+      result = await ai.models.generateContentStream({
+        model: process.env.GEMINI_TEXT_MODEL || "gemini-3-flash-preview",
         contents: messages,
         config: {
+          systemInstruction,
           tools: [{ functionDeclarations: tools }]
         }
       });
+
+      hasFunctionCall = false;
+      lastChunk = null;
+
+      for await (const chunk of result) {
+        lastChunk = chunk;
+        if (chunk.functionCalls && chunk.functionCalls.length > 0) {
+          hasFunctionCall = true;
+          break;
+        }
+        const text = chunk.text;
+        if (text) {
+          fullText += text;
+          if (onToken) onToken(text);
+        }
+      }
     }
 
-    return response.text || "I'm sorry, I couldn't generate a response.";
+    return fullText || "I'm sorry, I couldn't generate a response.";
   } catch (error) {
     console.error("askStudyAssistant failed:", error);
     return "I encountered an error while processing your request.";

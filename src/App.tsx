@@ -4,7 +4,7 @@
  */
 
 import { useState, useEffect } from "react";
-import { Note, QuizResult, AppData, LearningPlan, Module, Quiz, Flashcard, FlashcardSet } from "./types";
+import { Note, QuizResult, AppData, LearningPlan, Module, Quiz, Flashcard, FlashcardSet, Todo } from "./types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription, CardFooter } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -12,11 +12,13 @@ import { NoteEditor } from "./components/NoteEditor";
 import { Dashboard } from "./components/Dashboard";
 import { Quiz as QuizComponent } from "./components/Quiz";
 import { Flashcards } from "./components/Flashcards";
-import { BookOpen, LayoutDashboard, BrainCircuit, Settings, Database, RefreshCw, FolderTree, GraduationCap, Download, Sparkles, Plus, Loader2, CreditCard } from "lucide-react";
+import { KanbanBoard } from "./components/KanbanBoard";
+import { BookOpen, LayoutDashboard, BrainCircuit, Settings, Database, RefreshCw, FolderTree, GraduationCap, Download, Sparkles, Plus, Loader2, CreditCard, X, ListTodo, Calendar, MessageSquare } from "lucide-react";
 import { Toaster } from "sonner";
 import { toast } from "sonner";
 import ReactMarkdown from "react-markdown";
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
+import remarkGfm from "remark-gfm";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
 import { 
   initDB, getNotes, saveNote, deleteNote, getResults, saveResult, clearAndSeed, 
@@ -25,11 +27,12 @@ import {
   getModules, saveModule, deleteModule, getQuizzes, saveQuiz,
   getConversations, saveConversation, getTopicAnalysis, saveTopicAnalysis,
   getInitialAssessments, saveInitialAssessment,
-  getFlashcardSets, saveFlashcardSet, deleteFlashcardSet, getFlashcards, saveFlashcard
+  getFlashcardSets, saveFlashcardSet, deleteFlashcardSet, getFlashcards, saveFlashcard,
+  getTodos, saveTodo, deleteTodo, clearConversations
 } from "./lib/db";
-import { generateEmbedding, extractTopicsAndAnalyze } from "./lib/gemini";
-import { organizeQuickNote } from "./lib/noteAgent";
+import { generateEmbedding, extractTopicsAndAnalyze, generateFlashcardsFromNotes, generateQuizFromNotes, organizeQuickNote } from "./lib/ai";
 import { ChatAssistant } from "./components/ChatAssistant";
+import { LearningBook } from "./components/LearningBook";
 import { Management } from "./components/Management";
 import { SelectionScreen } from "./components/SelectionScreen";
 import { InitialAssessment, Conversation, TopicAnalysis } from "./types";
@@ -45,9 +48,11 @@ export default function App() {
     topicAnalysis: [],
     initialAssessments: [],
     flashcardSets: [],
-    flashcards: []
+    flashcards: [],
+    todos: []
   });
   const [activeTab, setActiveTab] = useState("dashboard");
+  const [studySubTab, setStudySubTab] = useState("flashcards");
   const [loading, setLoading] = useState(true);
   const [isSyncing, setIsSyncing] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
@@ -56,11 +61,19 @@ export default function App() {
   const [currentLearningPlanId, setCurrentLearningPlanId] = useState<string | undefined>(undefined);
   const [currentModuleId, setCurrentModuleId] = useState<string | undefined>(undefined);
 
+  const formatMarkdown = (content: any) => {
+    if (typeof content !== 'string') return JSON.stringify(content);
+    return content.replace(/\\n/g, '\n');
+  };
+
   useEffect(() => {
     const setup = async () => {
       try {
         // 1. Fetch initial data from server-side local file
         const res = await fetch("/api/data");
+        if (!res.ok) {
+          throw new Error(`Failed to fetch initial data: ${res.status}`);
+        }
         const initialData = await res.json();
         
         // 2. Initialize DuckDB-Wasm
@@ -122,7 +135,7 @@ export default function App() {
 
   const refreshData = async () => {
     try {
-      const [notes, results, learningPlans, modules, quizzes, conversations, topicAnalysis, initialAssessments, flashcardSets] = await Promise.all([
+      const [notes, results, learningPlans, modules, quizzes, conversations, topicAnalysis, initialAssessments, flashcardSets, todos] = await Promise.all([
         getNotes(currentLearningPlanId, currentModuleId), 
         getResults(),
         getLearningPlans(),
@@ -131,7 +144,8 @@ export default function App() {
         getConversations(currentLearningPlanId),
         getTopicAnalysis(currentLearningPlanId),
         getInitialAssessments(),
-        getFlashcardSets(currentLearningPlanId, currentModuleId)
+        getFlashcardSets(currentLearningPlanId, currentModuleId),
+        getTodos(currentLearningPlanId, currentModuleId)
       ]);
 
       const flashcards: Flashcard[] = [];
@@ -140,7 +154,7 @@ export default function App() {
         flashcards.push(...cards);
       }
 
-      const newData = { notes, results, learningPlans, modules, quizzes, conversations, topicAnalysis, initialAssessments, flashcardSets, flashcards };
+      const newData = { notes, results, learningPlans, modules, quizzes, conversations, topicAnalysis, initialAssessments, flashcardSets, flashcards, todos };
       setData(newData);
       return newData;
     } catch (error) {
@@ -148,22 +162,37 @@ export default function App() {
       return { 
         notes: [], results: [], learningPlans: [], modules: [], quizzes: [], 
         conversations: [], topicAnalysis: [], initialAssessments: [],
-        flashcardSets: [], flashcards: []
+        flashcardSets: [], flashcards: [], todos: []
       };
     }
   };
 
-  const syncWithServer = async (currentData: AppData) => {
+  const syncWithServer = async (currentData: AppData, retryCount = 0) => {
     setIsSyncing(true);
+    console.log(`[Sync] Starting sync. Attempt: ${retryCount + 1}. Data size: ${JSON.stringify(currentData).length} bytes`);
     try {
-      await fetch("/api/data", {
+      const response = await fetch("/api/data", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(currentData),
+        body: JSON.stringify(currentData, (_, value) => 
+          typeof value === 'bigint' ? Number(value) : value
+        ),
       });
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error(`[Sync] Server error: ${response.status} - ${errorText}`);
+        throw new Error(`Server responded with ${response.status}: ${errorText}`);
+      }
+      console.log("[Sync] Sync successful");
     } catch (error) {
-      console.error("Sync failed", error);
-      toast.error("Failed to persist data to local file");
+      console.error("[Sync] Sync failed", error);
+      if (retryCount < 2) {
+        console.log(`[Sync] Retrying sync... (${retryCount + 1})`);
+        setTimeout(() => syncWithServer(currentData, retryCount + 1), 1000);
+      } else {
+        toast.error(`Sync failed: ${error instanceof Error ? error.message : "Network error"}`);
+      }
     } finally {
       setIsSyncing(false);
     }
@@ -174,7 +203,18 @@ export default function App() {
     try {
       const embedding = await generateEmbedding(`${note.title} ${note.content} ${note.categories.join(' ')}`);
       console.log("Generated embedding:", embedding.length);
-      await saveNote({ ...note, embedding, learningPlanId: currentLearningPlanId, moduleId: currentModuleId });
+      
+      // Use provided IDs if available, otherwise fallback to current state
+      const learningPlanId = note.learningPlanId || currentLearningPlanId;
+      const moduleId = note.moduleId || currentModuleId;
+      
+      await saveNote({ 
+        ...note, 
+        embedding, 
+        learningPlanId, 
+        moduleId 
+      });
+      
       const newData = await refreshData();
       console.log("Data refreshed, syncing...");
       await syncWithServer(newData);
@@ -205,6 +245,37 @@ export default function App() {
       toast.success("Note deleted and sync completed");
     } catch (error) {
       toast.error("Failed to delete note");
+    }
+  };
+
+  const handleAddTodo = async (todo: Todo) => {
+    try {
+      await saveTodo(todo);
+      const newData = await refreshData();
+      await syncWithServer(newData);
+    } catch (error) {
+      toast.error("Failed to add task");
+    }
+  };
+
+  const handleUpdateTodo = async (todo: Todo) => {
+    try {
+      await saveTodo(todo);
+      const newData = await refreshData();
+      await syncWithServer(newData);
+    } catch (error) {
+      toast.error("Failed to update task");
+    }
+  };
+
+  const handleDeleteTodo = async (id: string) => {
+    try {
+      await deleteTodo(id);
+      const newData = await refreshData();
+      await syncWithServer(newData);
+      toast.success("Task removed");
+    } catch (error) {
+      toast.error("Failed to delete task");
     }
   };
 
@@ -359,6 +430,29 @@ export default function App() {
     }
   };
 
+  const handleMarkFlashcardLearned = async (cardId: string, learned: boolean) => {
+    try {
+      const card = data.flashcards.find(c => c.id === cardId);
+      if (!card) {
+        toast.error("Flashcard not found");
+        return;
+      }
+
+      const updatedCard: Flashcard = {
+        ...card,
+        learned,
+        updatedAt: new Date().toISOString()
+      };
+
+      await saveFlashcard(updatedCard);
+      const newData = await refreshData();
+      await syncWithServer(newData);
+    } catch (error) {
+      console.error("Failed to update flashcard:", error);
+      toast.error("Failed to mark flashcard");
+    }
+  };
+
   const handleExportBook = async (args: { learningPlanId?: string; moduleId?: string }) => {
     const notesToExport = await getNotes(args.learningPlanId, args.moduleId);
     if (notesToExport.length === 0) {
@@ -366,7 +460,7 @@ export default function App() {
       return "";
     }
 
-    let markdown = `# CertMaster AI - Study Book\n\n`;
+    let markdown = `# Learning Master - Study Book\n\n`;
     markdown += `Generated on: ${new Date().toLocaleString()}\n\n`;
 
     if (args.learningPlanId) {
@@ -386,7 +480,7 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `CertMaster_StudyBook_${new Date().toISOString().split('T')[0]}.md`;
+    a.download = `LearningMaster_StudyBook_${new Date().toISOString().split('T')[0]}.md`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -408,26 +502,47 @@ export default function App() {
 
   const agentCallbacks = {
     onAddNote: async (noteArgs: any) => {
+      const moduleId = noteArgs.moduleId || currentModuleId;
+      if (!moduleId) {
+        toast.error("Agent tried to add a note but no module was selected. Please select a module first.");
+        return;
+      }
       const newNote: Note = {
         id: crypto.randomUUID(),
         title: noteArgs.title,
         content: noteArgs.content,
         categories: noteArgs.categories,
         learningPlanId: noteArgs.learningPlanId || currentLearningPlanId,
-        moduleId: noteArgs.moduleId || currentModuleId,
+        moduleId: moduleId,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       };
       await handleAddNote(newNote);
     },
     onNavigate: (args: any) => {
-      if (args.view) setActiveTab(args.view === "learning" ? "notes" : args.view); // map learning to notes for now or specific view
+      if (args.view) {
+        if (args.view === "quiz") {
+          setActiveTab("flashcards");
+          setStudySubTab("quiz");
+        } else {
+          setActiveTab(args.view === "learning" ? "notes" : args.view);
+        }
+      }
       if (args.learningPlanId) setCurrentLearningPlanId(args.learningPlanId);
       if (args.moduleId) setCurrentModuleId(args.moduleId);
       toast.info(`Agent navigated to ${args.view}`);
     },
     onExportBook: handleExportBook,
-    onSaveConversation: handleSaveConversation
+    onSaveConversation: handleSaveConversation,
+    onClearHistory: async () => {
+      try {
+        await clearConversations(currentLearningPlanId);
+        const newData = await refreshData();
+        await syncWithServer(newData);
+      } catch (error) {
+        console.error("Failed to clear history", error);
+      }
+    }
   };
 
   const handleSaveQuiz = async (quiz: any) => {
@@ -445,37 +560,199 @@ export default function App() {
 
   const [isQuickNoteOpen, setIsQuickNoteOpen] = useState(false);
   const [quickInput, setQuickInput] = useState("");
+  const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [isOrganizing, setIsOrganizing] = useState(false);
+  const [isGeneratingFlashcards, setIsGeneratingFlashcards] = useState(false);
+  const [followUpNote, setFollowUpNote] = useState<Note | null>(null);
 
-  const handleQuickOrganize = async () => {
-    if (!quickInput) return;
-    setIsOrganizing(true);
-    try {
-      const availableModules = data.modules.map(m => ({ id: m.id, name: m.name, description: m.description }));
-      const organizedNotes = await organizeQuickNote(quickInput, undefined, availableModules);
-      
-      for (const organized of organizedNotes) {
-        const newNote: Note = {
-          id: crypto.randomUUID(),
-          title: organized.title,
-          content: organized.organizedContent,
-          rawContent: quickInput, // Preserve the raw input
-          categories: organized.categories,
-          learningPlanId: currentLearningPlanId,
-          moduleId: organized.moduleId || currentModuleId,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        };
-        await handleAddNote(newNote);
+  useEffect(() => {
+    const handleGlobalPaste = (e: ClipboardEvent) => {
+      // Don't trigger if we're already in an input or textarea
+      const target = e.target as HTMLElement;
+      if (target.tagName === "INPUT" || target.tagName === "TEXTAREA") {
+        return;
       }
 
-      setQuickInput("");
-      setIsQuickNoteOpen(false);
-      toast.success(`AI organized ${organizedNotes.length} note(s)!`);
+      const items = e.clipboardData?.items;
+      if (!items) return;
+
+      let hasContent = false;
+
+      for (let i = 0; i < items.length; i++) {
+        if (items[i].type.indexOf("image") !== -1) {
+          const file = items[i].getAsFile();
+          if (file) {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+              setSelectedImage(reader.result as string);
+              setIsQuickNoteOpen(true);
+            };
+            reader.readAsDataURL(file);
+            hasContent = true;
+          }
+        } else if (items[i].type === "text/plain") {
+          items[i].getAsString((text) => {
+            if (text.trim()) {
+              setQuickInput((prev) => prev ? prev + "\n" + text : text);
+              setIsQuickNoteOpen(true);
+            }
+          });
+          hasContent = true;
+        }
+      }
+
+      if (hasContent) {
+        toast.info("Pasted content captured by AI Organizer");
+      }
+    };
+
+    window.addEventListener("paste", handleGlobalPaste);
+    return () => window.removeEventListener("paste", handleGlobalPaste);
+  }, []);
+
+  const handleQuickOrganize = async () => {
+    if (!quickInput && !selectedImage) return;
+    
+    // Close modal immediately
+    setIsQuickNoteOpen(false);
+    
+    // Create a temporary placeholder note
+    const placeholderId = crypto.randomUUID();
+    const placeholderNote: Note = {
+      id: placeholderId,
+      title: "AI is Organizing...",
+      content: "",
+      categories: [],
+      isPlaceholder: true,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    
+    // Add placeholder to state immediately
+    await handleAddNote(placeholderNote);
+    
+    // Run organization in background
+    (async () => {
+      try {
+        const availableModules = data.modules.map(m => ({ id: m.id, name: m.name, description: m.description }));
+        const organizedNotes = await organizeQuickNote(quickInput, selectedImage?.split(",")[1], availableModules);
+        
+        // Remove placeholder
+        await deleteNote(placeholderId);
+        setData(prev => ({
+          ...prev,
+          notes: prev.notes.filter(n => n.id !== placeholderId)
+        }));
+
+        for (const organized of organizedNotes) {
+          const newNote: Note = {
+            id: crypto.randomUUID(),
+            title: organized.title,
+            content: organized.content || organized.organizedContent,
+            rawContent: quickInput,
+            categories: organized.categories || [],
+            learningPlanId: currentLearningPlanId,
+            moduleId: organized.moduleId || currentModuleId,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+          };
+          await handleAddNote(newNote);
+        }
+        
+        toast.success(`AI organized ${organizedNotes.length} note(s)!`);
+      } catch (error) {
+        console.error("Quick organize error:", error);
+        toast.error("Failed to organize note.");
+        // Cleanup placeholder on error
+        await deleteNote(placeholderId);
+        setData(prev => ({
+          ...prev,
+          notes: prev.notes.filter(n => n.id !== placeholderId)
+        }));
+      }
+    })();
+
+    setQuickInput("");
+    setSelectedImage(null);
+  };
+
+  const handleGenerateFlashcards = async () => {
+    let relevantNotes = data.notes.filter(n => {
+      if (currentModuleId) return n.moduleId === currentModuleId;
+      if (currentLearningPlanId) return n.learningPlanId === currentLearningPlanId;
+      return true;
+    });
+
+    if (relevantNotes.length === 0) {
+      toast.error("No notes found to generate flashcards from.");
+      return;
+    }
+
+    // Check for duplicates: Does a set already exist with these exact notes?
+    const relevantNoteIds = relevantNotes.map(n => n.id).sort();
+    const existingSet = data.flashcardSets.find(set => {
+      if (!set.noteIds) return false;
+      const setNoteIds = [...set.noteIds].sort();
+      return JSON.stringify(setNoteIds) === JSON.stringify(relevantNoteIds);
+    });
+
+    if (existingSet) {
+      toast.info("A flashcard set for these notes already exists.", {
+        description: "You can find it in your study materials."
+      });
+      return;
+    }
+
+    // Filter out notes that have already been used in any flashcard set
+    const usedNoteIds = new Set<string>();
+    for (const set of data.flashcardSets) {
+      if (set.noteIds) {
+        set.noteIds.forEach(id => usedNoteIds.add(id));
+      }
+    }
+
+    const unusedNotes = relevantNotes.filter(n => !usedNoteIds.has(n.id));
+
+    if (unusedNotes.length === 0) {
+      toast.info("All relevant notes have already been used to create flashcard sets.", {
+        description: "Try selecting different notes or create a new learning plan."
+      });
+      return;
+    }
+
+    if (unusedNotes.length < relevantNotes.length) {
+      toast.info(`${relevantNotes.length - unusedNotes.length} note(s) already used in other sets. Generating from ${unusedNotes.length} new note(s).`);
+    }
+
+    setIsGeneratingFlashcards(true);
+    try {
+      const generated = await generateFlashcardsFromNotes(unusedNotes, data.flashcards);
+      const setId = crypto.randomUUID();
+      const newSet: FlashcardSet = {
+        id: setId,
+        title: `AI Generated: ${unusedNotes[0]?.title || "Study Set"}`,
+        description: `Generated from ${unusedNotes.length} notes`,
+        learningPlanId: currentLearningPlanId,
+        moduleId: currentModuleId,
+        noteIds: unusedNotes.map(n => n.id),
+        createdAt: new Date().toISOString()
+      };
+
+      const newCards: Flashcard[] = generated.map((g: any) => ({
+        id: crypto.randomUUID(),
+        setId,
+        front: g.front,
+        back: g.back,
+        createdAt: new Date().toISOString()
+      }));
+
+      await handleAddFlashcardSet(newSet, newCards);
+      toast.success(`Generated ${newCards.length} flashcards!`);
     } catch (error) {
-      toast.error("Failed to organize note.");
+      console.error(error);
+      toast.error("Failed to generate flashcards.");
     } finally {
-      setIsOrganizing(false);
+      setIsGeneratingFlashcards(false);
     }
   };
 
@@ -501,111 +778,115 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-zinc-50/50 dark:bg-zinc-950">
-      <div className="max-w-7xl mx-auto px-4 py-6">
-        <header className="flex flex-col gap-6 mb-8">
+    <div className="h-screen flex flex-col bg-zinc-50/50 dark:bg-zinc-950 overflow-hidden">
+      <div className="flex-1 flex flex-col overflow-hidden">
+        <header className="flex flex-col gap-6 px-8 py-6 bg-white/50 dark:bg-zinc-900/50 backdrop-blur-xl border-b shrink-0">
           {/* Top Bar */}
-          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div className="max-w-[1600px] w-full mx-auto flex flex-col md:flex-row md:items-center justify-between gap-6">
             <div className="flex items-center gap-3">
-              <div className="p-2 bg-indigo-600 rounded-xl shadow-lg shadow-indigo-200">
-                <BrainCircuit className="w-8 h-8 text-white" />
+              <div className="p-2 bg-indigo-600 rounded-xl shadow-md">
+                <BrainCircuit className="w-6 h-6 text-white" />
               </div>
-              <div className="flex flex-col">
-                <h1 className="text-2xl font-bold tracking-tight text-zinc-900 dark:text-zinc-100 flex items-center gap-2">
-                  Learning Master AI
-                  <span className="text-[10px] bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full font-mono uppercase tracking-widest">In-Process DB</span>
-                </h1>
-              </div>
+              <h1 className="text-2xl font-bold tracking-tight text-zinc-900 dark:text-zinc-100 flex items-center gap-2">
+                Learning Master
+                <span className="text-[10px] bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full font-mono uppercase tracking-widest">v1.0</span>
+              </h1>
             </div>
 
-            <div className="flex items-center gap-1 bg-white dark:bg-zinc-900 p-1 rounded-full border shadow-sm">
+            <div className="flex items-center gap-2 bg-white dark:bg-zinc-900 p-1.5 rounded-full border shadow-md">
               <Button 
                 variant={activeTab === "dashboard" ? "default" : "ghost"} 
-                size="sm"
+                size="lg"
                 onClick={() => setActiveTab("dashboard")}
-                className="gap-2 rounded-full h-9 px-4"
+                className={`gap-3 rounded-full h-12 px-6 text-base font-bold transition-all ${activeTab === "dashboard" ? "shadow-lg shadow-indigo-100" : ""}`}
               >
-                <LayoutDashboard className="w-4 h-4" />
+                <LayoutDashboard className="w-5 h-5" />
                 Dashboard
               </Button>
               <Button 
-                variant={activeTab === "notes" ? "default" : "ghost"} 
-                size="sm"
-                onClick={() => setActiveTab("notes")}
-                className="gap-2 rounded-full h-9 px-4"
+                variant={activeTab === "kanban" ? "default" : "ghost"} 
+                size="lg"
+                onClick={() => setActiveTab("kanban")}
+                className={`gap-3 rounded-full h-12 px-6 text-base font-bold transition-all ${activeTab === "kanban" ? "shadow-lg shadow-indigo-100" : ""}`}
               >
-                <BookOpen className="w-4 h-4" />
+                <ListTodo className="w-5 h-5" />
+                Kanban
+              </Button>
+              <Button 
+                variant={activeTab === "notes" ? "default" : "ghost"} 
+                size="lg"
+                onClick={() => setActiveTab("notes")}
+                className={`gap-3 rounded-full h-12 px-6 text-base font-bold transition-all ${activeTab === "notes" ? "shadow-lg shadow-indigo-100" : ""}`}
+              >
+                <BookOpen className="w-5 h-5" />
                 Notes
               </Button>
               <Button 
-                variant={activeTab === "quiz" ? "default" : "ghost"} 
-                size="sm"
-                onClick={() => setActiveTab("quiz")}
-                className="gap-2 rounded-full h-9 px-4"
-              >
-                <BrainCircuit className="w-4 h-4" />
-                Challenge
-              </Button>
-              <Button 
                 variant={activeTab === "flashcards" ? "default" : "ghost"} 
-                size="sm"
-                onClick={() => setActiveTab("flashcards")}
-                className="gap-2 rounded-full h-9 px-4"
+                size="lg"
+                onClick={() => {
+                  setActiveTab("flashcards");
+                  setStudySubTab("flashcards");
+                }}
+                className={`gap-3 rounded-full h-12 px-6 text-base font-bold transition-all ${activeTab === "flashcards" ? "shadow-lg shadow-indigo-100" : ""}`}
               >
-                <GraduationCap className="w-4 h-4" />
-                Study & Review
+                <GraduationCap className="w-5 h-5" />
+                Study
               </Button>
               <Button 
                 variant={activeTab === "management" ? "default" : "ghost"} 
-                size="sm"
+                size="lg"
                 onClick={() => setActiveTab("management")}
-                className="gap-2 rounded-full h-9 px-4"
+                className={`gap-3 rounded-full h-12 px-6 text-base font-bold transition-all ${activeTab === "management" ? "shadow-lg shadow-indigo-100" : ""}`}
               >
-                <Settings className="w-4 h-4" />
+                <Settings className="w-5 h-5" />
                 Manage
               </Button>
             </div>
           </div>
 
           {/* Sub Bar */}
-          <div className="flex flex-wrap items-center justify-between gap-4 pt-4 border-t">
+          <div className="max-w-[1600px] w-full mx-auto flex flex-wrap items-center justify-between gap-4 pt-4 border-t border-zinc-100 dark:border-zinc-800">
             <div className="flex items-center gap-3">
-              <Button 
-                onClick={() => setIsQuickNoteOpen(true)}
-                className="bg-indigo-600 hover:bg-indigo-700 text-white rounded-full px-6 shadow-md hover:shadow-lg transition-all gap-2"
-              >
-                <Sparkles className="w-4 h-4" />
-                Generative AI
-              </Button>
               <Button 
                 variant="outline" 
                 size="sm" 
                 onClick={() => setCurrentLearningPlanId(undefined)}
-                className="text-zinc-500 hover:text-indigo-600 gap-2 h-10 rounded-full border-zinc-200 bg-white dark:bg-zinc-900 shadow-sm"
+                className="text-zinc-500 hover:text-indigo-600 gap-2 h-9 rounded-full border-zinc-200 bg-white dark:bg-zinc-900 shadow-sm text-sm"
               >
                 <RefreshCw className="w-4 h-4" />
                 Switch Path
               </Button>
-              <div className="flex items-center gap-2 px-4 py-2 bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 rounded-full text-sm font-medium border">
+              <div className="flex items-center gap-3 px-4 py-1.5 bg-zinc-50 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 rounded-full text-sm font-medium border shadow-sm">
                 <FolderTree className="w-4 h-4 text-indigo-500" />
-                {data.learningPlans.find(lp => lp.id === currentLearningPlanId)?.name || "No Path Selected"}
+                {data.learningPlans.find(lp => lp.id === currentLearningPlanId)?.name || "No Path"}
+                {data.learningPlans.find(lp => lp.id === currentLearningPlanId)?.dueDate && (
+                  <span className="ml-3 pl-3 border-l border-zinc-300 dark:border-zinc-600 flex items-center gap-2 text-rose-600 font-semibold">
+                    <Calendar className="w-3.5 h-3.5" />
+                    {new Date(data.learningPlans.find(lp => lp.id === currentLearningPlanId)!.dueDate!).toLocaleDateString()}
+                  </span>
+                )}
               </div>
             </div>
             
             {isSyncing && (
-              <span className="flex items-center gap-2 text-[10px] text-indigo-500 animate-pulse font-bold uppercase tracking-widest">
-                <RefreshCw className="w-3 h-3 animate-spin" />
-                Syncing with DuckDB
+              <span className="flex items-center gap-2 text-[8px] text-indigo-500 animate-pulse font-bold uppercase tracking-widest">
+                <RefreshCw className="w-2.5 h-2.5 animate-spin" />
+                Syncing
               </span>
             )}
           </div>
         </header>
 
-        <main className="pb-20">
+        <main className={`flex-1 overflow-hidden ${(effectiveTab === 'kanban' || effectiveTab === 'dashboard') ? '' : 'overflow-y-auto'}`}>
+          <div className={`${(effectiveTab === 'kanban' || effectiveTab === 'dashboard') ? 'h-full' : 'max-w-[1600px] mx-auto px-8 py-10'}`}>
           {effectiveTab === "dashboard" && (
             <Dashboard 
               data={data} 
-              onNavigateToQuiz={() => setActiveTab("quiz")} 
+              onNavigateToQuiz={() => {
+                setActiveTab("flashcards");
+                setStudySubTab("quiz");
+              }} 
               onNavigate={(tab) => setActiveTab(tab)}
               onAddLearningPlan={handleAddLearningPlan}
               onAddModule={handleAddModule}
@@ -646,115 +927,108 @@ export default function App() {
               currentModuleId={currentModuleId}
             />
           )}
-          {effectiveTab === "quiz" && (
-            <QuizComponent 
-              notes={data.notes} 
-              quizzes={data.quizzes || []}
-              onComplete={handleAddResult} 
-              onSaveQuiz={handleSaveQuiz}
+          {effectiveTab === "flashcards" && (
+            <div className="space-y-8">
+              <Tabs value={studySubTab} onValueChange={setStudySubTab} className="w-full">
+                <div className="flex justify-center mb-12">
+                  <TabsList className="bg-zinc-100/50 dark:bg-zinc-900/50 border shadow-sm rounded-full p-1.5 h-14">
+                    <TabsTrigger value="flashcards" className="rounded-full px-8 h-11 data-[state=active]:bg-white data-[state=active]:shadow-md font-bold text-sm">Flashcards</TabsTrigger>
+                    <TabsTrigger value="quiz" className="rounded-full px-8 h-11 data-[state=active]:bg-white data-[state=active]:shadow-md font-bold text-sm">Challenge</TabsTrigger>
+                    <TabsTrigger value="book" className="rounded-full px-8 h-11 data-[state=active]:bg-white data-[state=active]:shadow-md font-bold text-sm">Learning Book</TabsTrigger>
+                  </TabsList>
+                </div>
+
+                <TabsContent value="flashcards" className="space-y-8 outline-none focus-visible:ring-0">
+                  <Flashcards
+                    flashcardSets={data.flashcardSets}
+                    flashcards={data.flashcards}
+                    notes={data.notes}
+                    currentLearningPlanId={currentLearningPlanId}
+                    currentModuleId={currentModuleId}
+                    onAddSet={handleAddFlashcardSet}
+                    onDeleteSet={handleDeleteFlashcardSet}
+                    onMarkLearned={handleMarkFlashcardLearned}
+                    isGenerating={isGeneratingFlashcards}
+                    onGenerate={handleGenerateFlashcards}
+                    learningPlans={data.learningPlans}
+                  />
+                </TabsContent>
+
+                <TabsContent value="quiz" className="space-y-8">
+                  <QuizComponent 
+                    notes={data.notes} 
+                    quizzes={data.quizzes || []}
+                    onComplete={handleAddResult} 
+                    onSaveQuiz={handleSaveQuiz}
+                    onAddTodo={handleAddTodo}
+                    currentLearningPlanId={currentLearningPlanId}
+                    currentModuleId={currentModuleId}
+                    learningPlans={data.learningPlans}
+                    modules={data.modules}
+                  />
+                </TabsContent>
+
+                <TabsContent value="book" className="space-y-8">
+                  <LearningBook 
+                    notes={data.notes}
+                    modules={data.modules}
+                    learningPlans={data.learningPlans}
+                    currentLearningPlanId={currentLearningPlanId}
+                    currentModuleId={currentModuleId}
+                    onExport={() => handleExportBook({ learningPlanId: currentLearningPlanId, moduleId: currentModuleId })}
+                    onAskFollowUp={setFollowUpNote}
+                  />
+                </TabsContent>
+              </Tabs>
+            </div>
+          )}
+          {effectiveTab === "kanban" && (
+            <KanbanBoard 
+              todos={data.todos}
+              onAdd={handleAddTodo}
+              onUpdate={handleUpdateTodo}
+              onDelete={handleDeleteTodo}
               currentLearningPlanId={currentLearningPlanId}
               currentModuleId={currentModuleId}
               learningPlans={data.learningPlans}
               modules={data.modules}
+              topicAnalysis={data.topicAnalysis}
             />
           )}
-          {effectiveTab === "flashcards" && (
-            <Tabs defaultValue="flashcards" className="w-full">
-              <div className="flex justify-center mb-8">
-                <TabsList className="bg-white dark:bg-zinc-900 border shadow-sm rounded-full p-1">
-                  <TabsTrigger value="flashcards" className="rounded-full px-8">Flashcards</TabsTrigger>
-                  <TabsTrigger value="book" className="rounded-full px-8">Learning Book</TabsTrigger>
-                </TabsList>
-              </div>
-
-              <TabsContent value="flashcards">
-                <Flashcards 
-                  flashcardSets={data.flashcardSets}
-                  flashcards={data.flashcards}
-                  notes={data.notes}
-                  currentLearningPlanId={currentLearningPlanId}
-                  currentModuleId={currentModuleId}
-                  onAddSet={handleAddFlashcardSet}
-                  onDeleteSet={handleDeleteFlashcardSet}
-                />
-              </TabsContent>
-
-              <TabsContent value="book">
-                <div className="max-w-5xl mx-auto space-y-8">
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <h2 className="text-3xl font-bold tracking-tight">Learning Book</h2>
-                      <p className="text-zinc-500 mt-1">A comprehensive guide generated from your structured notes.</p>
-                    </div>
-                    <Button onClick={() => handleExportBook({ learningPlanId: currentLearningPlanId, moduleId: currentModuleId })} className="gap-2 rounded-full bg-indigo-600 hover:bg-indigo-700">
-                      <Download className="w-4 h-4" />
-                      Export PDF/MD
-                    </Button>
-                  </div>
-                  
-                  <div className="space-y-12">
-                    {data.notes.length > 0 ? (
-                      (() => {
-                        // Group notes by module
-                        const moduleGroups: { [key: string]: Note[] } = {};
-                        data.notes.forEach(note => {
-                          const mId = note.moduleId || "unassigned";
-                          if (!moduleGroups[mId]) moduleGroups[mId] = [];
-                          moduleGroups[mId].push(note);
-                        });
-
-                        return Object.entries(moduleGroups).map(([mId, mNotes]) => {
-                          const module = data.modules.find(m => m.id === mId);
-                          return (
-                            <section key={mId} className="space-y-6">
-                              <div className="flex items-center gap-4">
-                                <div className="h-px flex-1 bg-zinc-200"></div>
-                                <h3 className="text-sm font-bold uppercase tracking-[0.2em] text-indigo-500">
-                                  {module?.name || "Unassigned Notes"}
-                                </h3>
-                                <div className="h-px flex-1 bg-zinc-200"></div>
-                              </div>
-                              
-                              <div className="grid grid-cols-1 gap-8">
-                                {mNotes.map((note) => (
-                                  <Card key={note.id} className="border-none shadow-sm rounded-3xl overflow-hidden bg-white dark:bg-zinc-900">
-                                    <CardHeader className="p-8 pb-4">
-                                      <div className="flex items-center justify-between mb-4">
-                                        <div className="flex gap-2">
-                                          {note.categories.map(cat => (
-                                            <span key={cat} className="text-[10px] font-bold uppercase tracking-widest px-2 py-1 bg-zinc-100 dark:bg-zinc-800 rounded text-zinc-500">{cat}</span>
-                                          ))}
-                                        </div>
-                                        <span className="text-xs text-zinc-400 font-medium">{new Date(note.updatedAt).toLocaleDateString()}</span>
-                                      </div>
-                                      <CardTitle className="text-3xl font-bold tracking-tight">{note.title}</CardTitle>
-                                    </CardHeader>
-                                    <CardContent className="p-8 pt-0">
-                                      <div className="prose prose-zinc dark:prose-invert max-w-none prose-headings:text-indigo-600 prose-a:text-indigo-500">
-                                        <ReactMarkdown>{typeof note.content === 'string' ? note.content : JSON.stringify(note.content)}</ReactMarkdown>
-                                      </div>
-                                    </CardContent>
-                                  </Card>
-                                ))}
-                              </div>
-                            </section>
-                          );
-                        });
-                      })()
-                    ) : (
-                      <Card className="border-dashed border-2 flex flex-col items-center justify-center p-20 text-center bg-zinc-50/50">
-                        <BookOpen className="w-12 h-12 text-zinc-300 mb-4" />
-                        <h3 className="text-xl font-bold">Your book is empty</h3>
-                        <p className="text-zinc-500 max-w-sm mt-2">Add notes to modules to see them organized here as a comprehensive learning guide.</p>
-                      </Card>
-                    )}
-                  </div>
-                </div>
-              </TabsContent>
-            </Tabs>
-          )}
-        </main>
+        </div>
+      </main>
       </div>
+
+      <Dialog open={!!followUpNote} onOpenChange={(open) => !open && setFollowUpNote(null)}>
+        <DialogContent className="sm:max-w-4xl h-[85vh] p-0 overflow-hidden flex flex-col rounded-3xl border-none shadow-2xl">
+          <DialogHeader className="p-6 border-b shrink-0 bg-white">
+            <div className="flex items-center gap-4">
+              <div className="p-3 bg-indigo-50 rounded-2xl">
+                <MessageSquare className="w-6 h-6 text-indigo-600" />
+              </div>
+              <div>
+                <DialogTitle className="text-xl font-bold text-zinc-900">
+                  Follow-up: {followUpNote?.title}
+                </DialogTitle>
+                <DialogDescription className="text-zinc-500 mt-1">
+                  Ask questions specifically about this note. AI has the full context.
+                </DialogDescription>
+              </div>
+            </div>
+          </DialogHeader>
+          <div className="flex-1 min-h-0 bg-zinc-50/30">
+            {followUpNote && (
+              <ChatAssistant 
+                data={data} 
+                learningPlanId={followUpNote.learningPlanId}
+                callbacks={agentCallbacks}
+                embedded={true}
+                initialMessage={`I have a question about the note "${followUpNote.title}".`}
+              />
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {/* Quick AI Note Dialog */}
       <Dialog open={isQuickNoteOpen} onOpenChange={setIsQuickNoteOpen}>
@@ -769,17 +1043,34 @@ export default function App() {
             </p>
           </div>
           <div className="p-8 space-y-6">
-            <Textarea 
-              placeholder="Paste your notes here..." 
-              className="min-h-[300px] text-lg border-zinc-200 focus-visible:ring-indigo-500 resize-none bg-zinc-50 dark:bg-zinc-900/50 p-6 rounded-2xl"
-              value={quickInput}
-              onChange={(e) => setQuickInput(e.target.value)}
-            />
+            <div className="relative">
+              <Textarea 
+                placeholder="Paste your notes here..." 
+                className="min-h-[300px] text-lg border-zinc-200 focus-visible:ring-indigo-500 resize-none bg-zinc-50 dark:bg-zinc-900/50 p-6 rounded-2xl"
+                value={quickInput}
+                onChange={(e) => setQuickInput(e.target.value)}
+              />
+              {selectedImage && (
+                <div className="absolute bottom-4 right-4 w-24 h-24 rounded-xl overflow-hidden border-2 border-white shadow-lg group">
+                  <img src={selectedImage} alt="Pasted" className="w-full h-full object-cover" />
+                  <button 
+                    onClick={() => setSelectedImage(null)}
+                    className="absolute top-1 right-1 bg-black/50 text-white p-1 rounded-full opacity-0 group-hover:opacity-100 transition-opacity"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </div>
+              )}
+            </div>
             <div className="flex justify-end gap-3">
-              <Button variant="ghost" onClick={() => setIsQuickNoteOpen(false)} className="rounded-full">Cancel</Button>
+              <Button variant="ghost" onClick={() => {
+                setIsQuickNoteOpen(false);
+                setQuickInput("");
+                setSelectedImage(null);
+              }} className="rounded-full">Cancel</Button>
               <Button 
                 onClick={handleQuickOrganize} 
-                disabled={isOrganizing || !quickInput}
+                disabled={isOrganizing || (!quickInput && !selectedImage)}
                 className="rounded-full px-8 bg-indigo-600 hover:bg-indigo-700 h-12 text-lg font-semibold shadow-md"
               >
                 {isOrganizing ? <Loader2 className="w-5 h-5 animate-spin mr-2" /> : <Sparkles className="w-5 h-5 mr-2" />}

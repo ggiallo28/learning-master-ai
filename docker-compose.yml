@@ -1,13 +1,22 @@
-version: '3.8'
-
 services:
   certmaster-ai:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: learning-master-ai
     ports:
       - "3000:3000"
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - NODE_ENV=development
+      - AI_PROVIDER=${AI_PROVIDER}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
+      - AWS_REGION=${AWS_REGION}
+      - AWS_BEDROCK_TEXT_MODEL=${AWS_BEDROCK_TEXT_MODEL}
+      - AWS_BEDROCK_EMBED_MODEL=${AWS_BEDROCK_EMBED_MODEL}
     volumes:
       - .:/app
       - /app/node_modules
-    restart: always
+    restart: unless-stopped

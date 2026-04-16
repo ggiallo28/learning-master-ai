@@ -1,5 +1,5 @@
 import * as duckdb from '@duckdb/duckdb-wasm';
-import { Note, QuizResult, LearningPlan, Module, Quiz, Conversation, TopicAnalysis, InitialAssessment, AppData, Flashcard, FlashcardSet } from '../types';
+import { Note, QuizResult, LearningPlan, Module, Quiz, Conversation, TopicAnalysis, InitialAssessment, AppData, Flashcard, FlashcardSet, Todo } from '../types';
 
 let db: duckdb.AsyncDuckDB | null = null;
 let conn: duckdb.AsyncDuckDBConnection | null = null;
@@ -31,8 +31,19 @@ export async function initDB() {
         name TEXT,
         description TEXT,
         attachments JSON,
+        dueDate TEXT,
         createdAt TEXT
       );
+    `);
+
+    // Migration: Add dueDate to learning_plans if it doesn't exist
+    try {
+      await conn.query(`ALTER TABLE learning_plans ADD COLUMN dueDate TEXT`);
+    } catch (e) {
+      // Column probably already exists
+    }
+
+    await conn.query(`
       CREATE TABLE IF NOT EXISTS modules (
         id TEXT PRIMARY KEY,
         learningPlanId TEXT,
@@ -111,6 +122,19 @@ export async function initDB() {
         back TEXT,
         createdAt TEXT
       );
+      CREATE TABLE IF NOT EXISTS todos (
+        id TEXT PRIMARY KEY,
+        title TEXT,
+        description TEXT,
+        status TEXT,
+        dueDate TEXT,
+        learningPlanId TEXT,
+        moduleId TEXT,
+        createdAt TEXT,
+        updatedAt TEXT,
+        completedAt TEXT,
+        duration BIGINT
+      );
     `);
 
     // Initialize FTS index
@@ -144,9 +168,10 @@ export async function saveLearningPlan(lp: LearningPlan) {
   const name = lp.name.replace(/'/g, "''");
   const description = lp.description.replace(/'/g, "''");
   const attachments = JSON.stringify(lp.attachments || []).replace(/'/g, "''");
+  const dueDate = lp.dueDate ? `'${lp.dueDate}'` : 'NULL';
   await conn!.query(`
-    INSERT OR REPLACE INTO learning_plans (id, name, description, attachments, createdAt)
-    VALUES ('${lp.id}', '${name}', '${description}', '${attachments}', '${lp.createdAt}')
+    INSERT OR REPLACE INTO learning_plans (id, name, description, attachments, dueDate, createdAt)
+    VALUES ('${lp.id}', '${name}', '${description}', '${attachments}', ${dueDate}, '${lp.createdAt}')
   `);
 }
 
@@ -245,10 +270,16 @@ export async function getNotes(learningPlanId?: string, moduleId?: string): Prom
   });
 }
 
-export async function vectorSearchNotes(vector: number[], limit: number = 5, learningPlanId?: string, moduleId?: string): Promise<Note[]> {
+export async function vectorSearchNotes(vector: number[] | Float32Array, limit: number = 5, learningPlanId?: string, moduleId?: string): Promise<Note[]> {
   const { conn } = await initDB();
-  const vectorStr = `[${vector.join(',')}]`;
   
+  if (!vector || (Array.isArray(vector) && vector.length === 0)) return [];
+  
+  const vectorArray = Array.from(vector);
+  if (vectorArray.length === 0) return [];
+  
+  const vectorStr = `[${vectorArray.join(',')}]`;
+
   let whereClause = '';
   if (learningPlanId) whereClause += ` AND learningPlanId = '${learningPlanId}'`;
   if (moduleId) whereClause += ` AND moduleId = '${moduleId}'`;
@@ -256,9 +287,9 @@ export async function vectorSearchNotes(vector: number[], limit: number = 5, lea
   const result = await conn!.query(`
     SELECT *, 
            (list_dot_product(embedding, CAST('${vectorStr}' AS FLOAT[])) / 
-           (sqrt(list_dot_product(embedding, embedding)) * sqrt(list_dot_product(CAST('${vectorStr}' AS FLOAT[]), CAST('${vectorStr}' AS FLOAT[]))))) AS similarity
+           (NULLIF(sqrt(list_dot_product(embedding, embedding)), 0) * sqrt(list_dot_product(CAST('${vectorStr}' AS FLOAT[]), CAST('${vectorStr}' AS FLOAT[]))))) AS similarity
     FROM notes
-    WHERE embedding IS NOT NULL ${whereClause}
+    WHERE embedding IS NOT NULL AND list_dot_product(embedding, embedding) > 0 ${whereClause}
     ORDER BY similarity DESC
     LIMIT ${limit}
   `);
@@ -272,12 +303,26 @@ export async function vectorSearchNotes(vector: number[], limit: number = 5, lea
   });
 }
 
-export async function saveNote(note: Note & { embedding?: number[] }) {
+export async function getNote(id: string): Promise<Note | null> {
+  const { conn } = await initDB();
+  const result = await conn!.query(`SELECT * FROM notes WHERE id = '${id}'`);
+  const rows = result.toArray();
+  if (rows.length === 0) return null;
+  const data = rows[0].toJSON();
+  return {
+    ...data,
+    categories: data.categories ? JSON.parse(data.categories) : []
+  } as Note;
+}
+
+export async function saveNote(note: Note) {
   const { conn } = await initDB();
   const title = note.title.replace(/'/g, "''");
   const content = note.content.replace(/'/g, "''");
   const categories = JSON.stringify(note.categories).replace(/'/g, "''");
-  const embeddingStr = note.embedding ? `CAST('[${note.embedding.join(',')}]' AS FLOAT[])` : 'NULL';
+  const embeddingStr = (note.embedding && (Array.isArray(note.embedding) || (note.embedding as any) instanceof Float32Array)) 
+    ? `CAST('[${Array.from(note.embedding).join(',')}]' AS FLOAT[])` 
+    : 'NULL';
   const lpId = note.learningPlanId ? `'${note.learningPlanId}'` : 'NULL';
   const mId = note.moduleId ? `'${note.moduleId}'` : 'NULL';
   
@@ -287,12 +332,14 @@ export async function saveNote(note: Note & { embedding?: number[] }) {
   `);
 }
 
-export async function updateNote(note: Note & { embedding?: number[] }) {
+export async function updateNote(note: Note) {
   const { conn } = await initDB();
   const title = note.title.replace(/'/g, "''");
   const content = note.content.replace(/'/g, "''");
   const categories = JSON.stringify(note.categories).replace(/'/g, "''");
-  const embeddingStr = note.embedding ? `embedding = CAST('[${note.embedding.join(',')}]' AS FLOAT[]),` : '';
+  const embeddingStr = (note.embedding && (Array.isArray(note.embedding) || (note.embedding as any) instanceof Float32Array)) 
+    ? `embedding = CAST('[${Array.from(note.embedding).join(',')}]' AS FLOAT[]),` 
+    : '';
   const lpId = note.learningPlanId ? `'${note.learningPlanId}'` : 'NULL';
   const mId = note.moduleId ? `'${note.moduleId}'` : 'NULL';
   const updatedAt = new Date().toISOString();
@@ -307,6 +354,33 @@ export async function updateNote(note: Note & { embedding?: number[] }) {
 export async function deleteNote(id: string) {
   const { conn } = await initDB();
   await conn!.query(`DELETE FROM notes WHERE id = '${id}'`);
+}
+
+export async function mergeNotes(sourceId: string, targetId: string) {
+  const { conn } = await initDB();
+  const source = await getNote(sourceId);
+  const target = await getNote(targetId);
+  
+  if (!source || !target) return;
+
+  const mergedContent = `${target.content}\n\n---\nMerged from ${source.title}:\n${source.content}`;
+  
+  await conn!.query(`
+    UPDATE notes 
+    SET content = '${mergedContent.replace(/'/g, "''")}',
+        updatedAt = '${new Date().toISOString()}'
+    WHERE id = '${targetId}'
+  `);
+  
+  await deleteNote(sourceId);
+}
+
+export async function suggestSimilarNotes(noteId: string, limit: number = 3): Promise<Note[]> {
+  const note = await getNote(noteId);
+  if (!note || !note.embedding) return [];
+  
+  const similar = await vectorSearchNotes(note.embedding, limit + 1, note.learningPlanId);
+  return similar.filter(n => n.id !== noteId);
 }
 
 export async function getResults(): Promise<QuizResult[]> {
@@ -467,6 +541,53 @@ export async function saveFlashcard(card: Flashcard) {
   `);
 }
 
+// Todo CRUD
+export async function getTodos(learningPlanId?: string, moduleId?: string): Promise<Todo[]> {
+  const { conn } = await initDB();
+  let whereClause = '';
+  if (learningPlanId) whereClause += ` WHERE learningPlanId = '${learningPlanId}'`;
+  if (moduleId) whereClause += learningPlanId ? ` AND moduleId = '${moduleId}'` : ` WHERE moduleId = '${moduleId}'`;
+  
+  const result = await conn!.query(`SELECT * FROM todos ${whereClause} ORDER BY createdAt DESC`);
+  return result.toArray().map(row => {
+    const json = row.toJSON() as any;
+    // DuckDB returns BIGINT as BigInt, which JSON.stringify cannot handle
+    if (json.duration !== null && typeof json.duration === 'bigint') {
+      json.duration = Number(json.duration);
+    }
+    return json as Todo;
+  });
+}
+
+export async function saveTodo(todo: Todo) {
+  const { conn } = await initDB();
+  const title = todo.title.replace(/'/g, "''");
+  const description = (todo.description || '').replace(/'/g, "''");
+  const dueDate = todo.dueDate ? `'${todo.dueDate}'` : 'NULL';
+  const completedAt = todo.completedAt ? `'${todo.completedAt}'` : 'NULL';
+  const duration = todo.duration !== undefined ? todo.duration : 'NULL';
+  const lpId = todo.learningPlanId ? `'${todo.learningPlanId}'` : 'NULL';
+  const mId = todo.moduleId ? `'${todo.moduleId}'` : 'NULL';
+  
+  await conn!.query(`
+    INSERT OR REPLACE INTO todos (id, title, description, status, dueDate, learningPlanId, moduleId, createdAt, updatedAt, completedAt, duration)
+    VALUES ('${todo.id}', '${title}', '${description}', '${todo.status}', ${dueDate}, ${lpId}, ${mId}, '${todo.createdAt}', '${todo.updatedAt}', ${completedAt}, ${duration})
+  `);
+}
+
+export async function deleteTodo(id: string) {
+  const { conn } = await initDB();
+  await conn!.query(`DELETE FROM todos WHERE id = '${id}'`);
+}
+
+export async function clearConversations(learningPlanId?: string) {
+  const { conn } = await initDB();
+  const query = learningPlanId 
+    ? `DELETE FROM conversations WHERE learningPlanId = '${learningPlanId}'`
+    : `DELETE FROM conversations`;
+  await conn!.query(query);
+}
+
 export async function getFullDump(): Promise<AppData> {
   const notes = await getNotes();
   const results = await getResults();
@@ -477,6 +598,7 @@ export async function getFullDump(): Promise<AppData> {
   const topicAnalysis = await getTopicAnalysis();
   const initialAssessments = await getInitialAssessments();
   const flashcardSets = await getFlashcardSets();
+  const todos = await getTodos();
   
   const flashcards: Flashcard[] = [];
   for (const set of flashcardSets) {
@@ -494,7 +616,8 @@ export async function getFullDump(): Promise<AppData> {
     topicAnalysis,
     initialAssessments,
     flashcardSets,
-    flashcards
+    flashcards,
+    todos
   };
 }
 
@@ -509,7 +632,8 @@ export async function importDump(data: AppData) {
     data.topicAnalysis,
     data.initialAssessments,
     data.flashcardSets,
-    data.flashcards
+    data.flashcards,
+    data.todos
   );
 }
 
@@ -523,7 +647,8 @@ export async function clearAndSeed(
   topicAnalysis: TopicAnalysis[] = [],
   initialAssessments: InitialAssessment[] = [],
   flashcardSets: FlashcardSet[] = [],
-  flashcards: Flashcard[] = []
+  flashcards: Flashcard[] = [],
+  todos: Todo[] = []
 ) {
   const { conn } = await initDB();
   await conn!.query(`
@@ -537,6 +662,7 @@ export async function clearAndSeed(
     DELETE FROM initial_assessments;
     DELETE FROM flashcard_sets;
     DELETE FROM flashcards;
+    DELETE FROM todos;
   `);
   
   for (const lp of learningPlans) await saveLearningPlan(lp);
@@ -549,4 +675,5 @@ export async function clearAndSeed(
   for (const assessment of initialAssessments) await saveInitialAssessment(assessment);
   for (const set of flashcardSets) await saveFlashcardSet(set);
   for (const card of flashcards) await saveFlashcard(card);
+  for (const todo of todos) await saveTodo(todo);
 }

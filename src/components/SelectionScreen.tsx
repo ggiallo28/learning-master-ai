@@ -15,7 +15,7 @@ interface SelectionScreenProps {
 
 export function SelectionScreen({ learningPlans, onSelect, onCreate }: SelectionScreenProps) {
   const [isCreating, setIsCreating] = useState(false);
-  const [newPlan, setNewPlan] = useState({ name: "", description: "" });
+  const [newPlan, setNewPlan] = useState({ name: "", description: "", dueDate: "" });
 
   const handleCreate = () => {
     if (!newPlan.name) return;
@@ -23,6 +23,7 @@ export function SelectionScreen({ learningPlans, onSelect, onCreate }: Selection
       id: crypto.randomUUID(),
       name: newPlan.name,
       description: newPlan.description,
+      dueDate: newPlan.dueDate || undefined,
       createdAt: new Date().toISOString()
     };
     onCreate(lp);
@@ -40,7 +41,7 @@ export function SelectionScreen({ learningPlans, onSelect, onCreate }: Selection
             <BrainCircuit className="w-10 h-10" />
           </div>
           <h1 className="text-4xl font-bold tracking-tight text-zinc-900 dark:text-zinc-100">
-            Welcome to CertMaster AI
+            Learning Master
           </h1>
           <p className="text-zinc-500 dark:text-zinc-400 text-lg max-w-lg mx-auto">
             Select a learning path to continue your journey or create a new one to start fresh.
@@ -114,6 +115,14 @@ export function SelectionScreen({ learningPlans, onSelect, onCreate }: Selection
                   className="h-32"
                   value={newPlan.description}
                   onChange={(e) => setNewPlan(prev => ({ ...prev, description: e.target.value }))}
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Target Deadline (Optional)</label>
+                <Input 
+                  type="date"
+                  value={newPlan.dueDate}
+                  onChange={(e) => setNewPlan(prev => ({ ...prev, dueDate: e.target.value }))}
                 />
               </div>
             </CardContent>
